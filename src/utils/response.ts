@@ -10,8 +10,8 @@ export function fail(message: string, code = 500): ApiResponse<null> {
   return { success: false, code, message, data: null };
 }
 
-/** 统一 JSON 返回 */
-export function json<T>(resp: ApiResponse<T>, status = 200): Response {
+/** 统一 JSON 返回（resp 可附带额外字段） */
+export function json<T>(resp: ApiResponse<T> | Record<string, unknown>, status = 200): Response {
   return Response.json(resp, {
     status,
     headers: {

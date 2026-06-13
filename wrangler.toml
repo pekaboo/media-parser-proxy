@@ -1,19 +1,18 @@
 name = "media-parser-proxy"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
-
-# 使用 Workers 原生 fetch，无需 nodejs_compat
 compatibility_flags = []
-
-# 开发: npx wrangler dev
-# 部署: npx wrangler deploy
 
 [observability]
 enabled = true
 
-# 可选：环境变量（也可在 dashboard 配置）
 [vars]
 DEFAULT_TIMEOUT_MS = "30000"
+
+# KV namespace：风控冷却器使用
+[[kv_namespaces]]
+binding = "COOLDOWN_KV"
+id = "e02b48c707aa4e529d45f8f8dbf0124e"
 
 # 自定义域名绑定（自动管理 DNS + SSL 证书）
 routes = [

@@ -4,17 +4,22 @@ import {
   decryptHellotikResponse,
   encryptHellotikRequest,
 } from '../crypto/hellotik-crypto';
+import { AppError, ErrorCode, type HellotikRestrictedBody } from '../types/errors';
+import { Cooldown } from '../utils/cooldown';
 
 /**
  * HelloTik Douyin Provider
  *
  * 实现链路：
- *  1. POST /api/gate-e5eea8  → 获取 ticket(tk) + seed(sd)
- *  2. SHA-256(ticket:seed) → AES-256-GCM 密钥，加密 payload
- *  3. POST /api/parse       → 获取加密响应
- *  4. decryptHellotikResponse 解密
+ *  1. 检查冷却（KV）—— 冷却期内直接拒绝，避免刷新上游限流计时
+ *  2. 节流（KV）—— 强制最小请求间隔，降低风控触发概率
+ *  3. POST /api/gate-e5eea8 → 获取 ticket(tk) + seed(sd)
+ *  4. SHA-256(ticket:seed) → AES-256-GCM 密钥，加密 payload
+ *  5. POST /api/parse → 获取加密响应
+ *  6. decryptHellotikResponse 解密
  *
- * 该实现仅依赖 hellotik.app 的公开 Web 接口与逆向的加解密逻辑。
+ * 风控处理：上游返回 TICKET_IP_RESTRICTED 时触发冷却，
+ * 后续请求在冷却期内不发出网络请求。
  */
 const BASE_URL = 'https://www.hellotik.app';
 
@@ -33,6 +38,12 @@ const PROFILE = {
     version: 'vr_e5eea8',
   },
 } as const;
+
+/** 上游风控特征码（命中即触发冷却） */
+const RESTRICTION_REASONS = new Set([
+  'ticket_ip_restricted',
+  'rate_limited',
+]);
 
 interface HellotikMediaItem {
   url?: string;
@@ -71,23 +82,53 @@ export class HellotikDouyinProvider extends BaseProvider {
     return 0;
   }
 
+  /** 获取冷却器实例（每次请求新建，无状态开销） */
+  private cooldown(env: Env): Cooldown | null {
+    if (!env.COOLDOWN_KV) return null;
+    return new Cooldown(env.COOLDOWN_KV);
+  }
+
   protected async doParse(
     request: ParseRequest,
     env: Env,
   ): Promise<ParseResult> {
     const url = request.rawString.trim();
     if (!url) {
-      throw new Error('rawString 不能为空');
+      throw new AppError('rawString 不能为空', ErrorCode.PARAM_MISSING, 400);
     }
 
-    // 1. 获取 ticket + seed
+    const cd = this.cooldown(env);
+
+    // 1. 冷却期检查 —— 冷却中直接拒绝，避免刷新上游计时
+    if (cd) {
+      const st = await cd.status();
+      if (st.active) {
+        throw new AppError(
+          `上游风控冷却中，请 ${st.remainingSec}s 后重试`,
+          ErrorCode.UPSTREAM_RESTRICTED,
+          503,
+          { retryAfterSec: st.remainingSec },
+        );
+      }
+      // 2. 节流：强制最小间隔
+      if (await cd.shouldThrottle()) {
+        throw new AppError(
+          '请求过于频繁，请稍候',
+          ErrorCode.RATE_LIMITED,
+          429,
+        );
+      }
+    }
+
+    // 3. 获取 ticket + seed（内部已处理风控识别 → 触发冷却）
     const { ticketData, cookie } = await this.fetchTicket(
       url,
       request.isBatch ?? false,
       env,
+      cd,
     );
 
-    // 2. 构建 payload（与前端 buildParseRequestParams 对齐）
+    // 4. 构建 payload（与前端 buildParseRequestParams 对齐）
     const payload = {
       requestURL: url,
       isMobile: 'false',
@@ -101,14 +142,14 @@ export class HellotikDouyinProvider extends BaseProvider {
       ...request.meta,
     };
 
-    // 3. 加密 payload
+    // 5. 加密 payload
     const encrypted = await encryptHellotikRequest(
       payload,
       ticketData.ticket,
       ticketData.seed,
     );
 
-    // 4. 组装 parse 请求体（字段名按 profile 映射）
+    // 6. 组装 parse 请求体（字段名按 profile 映射）
     const prf = PROFILE.parseRequestFields;
     const parseBody: Record<string, unknown> = {
       [prf.key]: ticketData.ticket,
@@ -117,7 +158,7 @@ export class HellotikDouyinProvider extends BaseProvider {
       [prf.version]: encrypted.v,
     };
 
-    // 5. 发送 parse
+    // 7. 发送 parse
     const parseResp = await this.fetchWithTimeout(
       `${BASE_URL}/api/parse`,
       {
@@ -128,8 +169,22 @@ export class HellotikDouyinProvider extends BaseProvider {
       env,
     );
 
+    if (parseResp.status === 429) {
+      // parse 阶段也可能风控
+      const body = await this.tryJson(parseResp);
+      await this.handleRestriction(cd, body);
+      throw new AppError(
+        '上游 parse 阶段风控',
+        ErrorCode.UPSTREAM_RESTRICTED,
+        503,
+      );
+    }
+
     if (!parseResp.ok) {
-      throw new Error(`parse 接口异常: HTTP ${parseResp.status}`);
+      throw new AppError(
+        `parse 接口异常 HTTP ${parseResp.status}`,
+        ErrorCode.UPSTREAM_UNAVAILABLE,
+      );
     }
 
     const parseJson = (await parseResp.json()) as {
@@ -141,18 +196,29 @@ export class HellotikDouyinProvider extends BaseProvider {
     };
 
     if (parseJson.status !== 0) {
-      throw new Error(`parse 失败: ${parseJson.error ?? JSON.stringify(parseJson)}`);
+      throw new AppError(
+        parseJson.error ?? '上游解析失败',
+        ErrorCode.UPSTREAM_PARSE_FAILED,
+      );
     }
 
-    // 6. 解密响应
+    // 8. 解密响应
     if (!parseJson.encrypt || !parseJson.data || !parseJson.key) {
-      throw new Error('响应缺少加密数据');
+      throw new AppError('响应缺少加密数据', ErrorCode.UPSTREAM_DECRYPT_FAILED);
     }
 
-    const decrypted = (await decryptHellotikResponse(
-      parseJson.data,
-      parseJson.key,
-    )) as HellotikRawData;
+    let decrypted: HellotikRawData;
+    try {
+      decrypted = (await decryptHellotikResponse(
+        parseJson.data,
+        parseJson.key,
+      )) as HellotikRawData;
+    } catch {
+      throw new AppError(
+        '响应解密失败（算法可能已变更）',
+        ErrorCode.UPSTREAM_DECRYPT_FAILED,
+      );
+    }
 
     return this.normalize(decrypted);
   }
@@ -162,6 +228,7 @@ export class HellotikDouyinProvider extends BaseProvider {
     url: string,
     isBatch: boolean,
     env: Env,
+    cd: Cooldown | null,
   ): Promise<{
     ticketData: { ticket: string; seed: string; expiresAt: string };
     cookie: string | undefined;
@@ -171,17 +238,42 @@ export class HellotikDouyinProvider extends BaseProvider {
       {
         method: 'POST',
         headers: { ...this.headers(env), 'Cache-Control': 'no-store' },
-        body: JSON.stringify({ requestURL: url, isBatch, mode: isBatch ? 'batch' : 'single' }),
+        body: JSON.stringify({
+          requestURL: url,
+          isBatch,
+          mode: isBatch ? 'batch' : 'single',
+        }),
       },
       env,
     );
-    if (!resp.ok) {
-      throw new Error(`ticket 接口异常: HTTP ${resp.status}`);
+
+    // gate 风控识别（核心）
+    if (resp.status === 429) {
+      const body = await this.tryJson(resp);
+      await this.handleRestriction(cd, body);
+      // handleRestriction 已写入冷却，此处抛标准化错误
+      throw new AppError(
+        '上游 gate 阶段风控，已进入冷却',
+        ErrorCode.UPSTREAM_RESTRICTED,
+        503,
+      );
     }
+
+    if (!resp.ok) {
+      throw new AppError(
+        `ticket 接口异常 HTTP ${resp.status}`,
+        ErrorCode.UPSTREAM_UNAVAILABLE,
+      );
+    }
+
     const data = (await resp.json()) as Record<string, unknown>;
     if (!data.success) {
-      throw new Error(`ticket 获取失败: ${JSON.stringify(data)}`);
+      throw new AppError(
+        'ticket 获取失败',
+        ErrorCode.UPSTREAM_PARSE_FAILED,
+      );
     }
+
     const trf = PROFILE.ticketResponseFields;
     // 捕获 gate 下发的 set-cookie，parse 请求需回传以保持会话
     const setCookie = resp.headers.get('set-cookie') ?? undefined;
@@ -194,6 +286,29 @@ export class HellotikDouyinProvider extends BaseProvider {
       },
       cookie,
     };
+  }
+
+  /**
+   * 处理上游风控响应
+   * 识别已知 restriction reason，触发冷却；未知风控也保守触发默认冷却
+   */
+  private async handleRestriction(
+    cd: Cooldown | null,
+    body: HellotikRestrictedBody | null,
+  ): Promise<void> {
+    if (!cd) return; // 无 KV 时不做冷却
+    const isKnown = body?.reason && RESTRICTION_REASONS.has(body.reason);
+    // 已知风控用上游给的分钟数；未知风控用默认冷却
+    await cd.trigger(isKnown ? body?.restrictionMinutes : undefined);
+  }
+
+  /** 安全解析 JSON（失败返回 null） */
+  private async tryJson(resp: Response): Promise<HellotikRestrictedBody | null> {
+    try {
+      return (await resp.json()) as HellotikRestrictedBody;
+    } catch {
+      return null;
+    }
   }
 
   /** 将 hellotik 原始结构转为统一 ParseResult */
@@ -246,7 +361,7 @@ export class HellotikDouyinProvider extends BaseProvider {
     };
     // 可选：注入 cookie（应对反爬，通过环境变量 HELLOTIK_COOKIE 配置）
     if (env?.HELLOTIK_COOKIE) {
-      h['Cookie'] = env.HELLOTIK_COOKIE;
+      h['Cookie'] = env.HELLOTIK_COOKIE as string;
     } else if (cookie) {
       // 优先使用 gate 接口下发的会话 cookie
       h['Cookie'] = cookie;
@@ -256,7 +371,6 @@ export class HellotikDouyinProvider extends BaseProvider {
 
   /** 从 set-cookie 头解析出 name=value 对（多个用 ; 拼接） */
   private parseCookies(setCookie: string): string {
-    // set-cookie 可能是多条用逗号分隔，简化处理：提取所有 name=value
     const parts = setCookie.split(/,(?=\s*[A-Za-z0-9_-]+=)/);
     return parts
       .map((p) => p.split(';')[0]!.trim())
@@ -275,6 +389,14 @@ export class HellotikDouyinProvider extends BaseProvider {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       return await fetch(input, { ...init, signal: controller.signal });
+    } catch (e) {
+      // 超时/网络错误归一化
+      throw new AppError(
+        e instanceof Error && e.name === 'AbortError'
+          ? '上游请求超时'
+          : '上游网络错误',
+        ErrorCode.UPSTREAM_UNAVAILABLE,
+      );
     } finally {
       clearTimeout(timer);
     }

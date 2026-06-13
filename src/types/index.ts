@@ -89,6 +89,8 @@ export interface ParseProvider {
 /** Worker 环境变量 */
 export interface Env {
   DEFAULT_TIMEOUT_MS?: string;
+  /** 冷却器使用的 KV namespace（风控节流） */
+  COOLDOWN_KV?: KVNamespace;
   /** 各 Provider 可读取的自定义密钥/配置 */
-  [key: string]: string | undefined;
+  [key: string]: string | KVNamespace | undefined;
 }
